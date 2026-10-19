@@ -24,7 +24,7 @@ def test_balance_tampered():
     ]
     result = reconcile_balance(tx)
     assert result["reconciled"] is False
-        assert result["difference"] == -2000.0
+    assert result["difference"] == -2000.0
 
 def test_circular_transfer_detected():
     tx = [
