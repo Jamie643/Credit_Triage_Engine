@@ -226,3 +226,10 @@ pycache/
 venv/
 .venv/
 env/
+Data — never commit real statements
+data/samples/*
+!data/samples/.gitkeep
+
+OS
+.DS_Store
+Thumbs.db
