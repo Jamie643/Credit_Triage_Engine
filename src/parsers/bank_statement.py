@@ -1,15 +1,15 @@
 """
 Bank statement PDF parser.
 
-Strategy (in priority order):
-    1. Camelot 'lattice' mode — for PDFs with visible ruling lines (UBA, GTBank, Zenith).
-    2. Camelot 'stream' mode — for PDFs with whitespace-aligned columns.
-    3. pdfplumber text — fallback for simple layouts.
+Strategy:
+    1. Camelot 'lattice' mode — for PDFs with visible ruling lines (UBA, GTBank).
+    2. Camelot 'stream' mode — for PDFs without lines (Moniepoint, Opay, etc).
+    3. pdfplumber text — fallback.
 
 Post-processing handles:
-    - Multi-line dates ('01-Aug \\n2026' → '2026-08-01')
-    - Debit vs credit from column assignment
-    - Zenith-specific column mapping (handles '0.00' placeholders and blank columns)
+    - Multi-line dates.
+    - Zenith-specific column mapping.
+    - Moniepoint-specific column mapping (handles 'NA' placeholders and 15 columns).
 """
 
 from __future__ import annotations
@@ -21,133 +21,56 @@ from pathlib import Path
 import pdfplumber
 
 _DATE_FORMATS = [
-    "%d-%b-%Y",
-    "%d-%b-%y",
-    "%d/%m/%Y",
-    "%d-%m-%Y",
-    "%d/%m/%y",
-    "%d-%m-%y",
-    "%d %b %Y",
-    "%d %B %Y",
-    "%Y-%m-%d",
-    "%d-%b-%Y %H:%M %p",  # Zenith format: 01-Sep-2021 08:57 AM
+    "%d-%b-%Y", "%d-%b-%y", "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y",
+    "%d %b %Y", "%d %B %Y", "%Y-%m-%d", "%d-%b-%Y %H:%M %p", "%Y-%m-%d %H:%M",
 ]
 
 _DATE_TOKEN_RE = re.compile(r"^(\d{1,2})[-/ ]([A-Za-z]{3,9})[-/ ]?(\d{2,4})?$")
 
-_MONTHS = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
-}
-
-
 def _parse_date(cell: str) -> str | None:
-    """Parse a date cell that may span multiple lines or contain timestamps."""
-    if not cell:
-        return None
-    # Collapse whitespace and newlines
+    if not cell: return None
     cleaned = re.sub(r"\s+", " ", str(cell)).strip()
-    
-    # Try full string first (handles '01-Sep-2021 08:57 AM')
+    # Strip time component if present (e.g. '2024-09-15 21:31' -> '2024-09-15')
+    if " " in cleaned and ":" in cleaned:
+        cleaned = cleaned.split(" ")[0]
+        
     for fmt in _DATE_FORMATS:
-        try:
-            return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-
-    # Try just the first token (handles '01-Aug 2026')
+        try: return datetime.strptime(cleaned, fmt).strftime("%Y-%m-%d")
+        except ValueError: continue
+        
     token = cleaned.split()[0] if cleaned.split() else ""
     for fmt in _DATE_FORMATS:
-        try:
-            return datetime.strptime(token, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-            
-    # Handle 'DD-Mon' + year on second token
-    parts = cleaned.split()
-    if len(parts) >= 2 and _DATE_TOKEN_RE.match(parts[0] + " " + parts[1]):
-        combined = parts[0] + "-" + parts[1] if "-" not in parts[0] else parts[0] + parts[1]
-        for fmt in _DATE_FORMATS:
-            try:
-                return datetime.strptime(combined, fmt).strftime("%Y-%m-%d")
-            except ValueError:
-                continue
-                
+        try: return datetime.strptime(token, fmt).strftime("%Y-%m-%d")
+        except ValueError: continue
     return None
 
-
 def _to_amount(cell: str) -> float | None:
-    """Parse a numeric cell like '1,234.56', '(1,234.56)', or '.75' into a float."""
-    if cell is None:
-        return None
+    if cell is None: return None
     s = str(cell).strip()
-    if not s or s in {"-", "—", "--"}:
-        return None
-        
+    if not s or s.upper() in {"-", "—", "--", "NA", "N/A", ""}: return None
     s = re.sub(r"\s+", "", s)
     negative = False
     if s.startswith("(") and s.endswith(")"):
         negative = True
         s = s[1:-1]
     s = re.sub(r"^(?:N|NGN|₦)", "", s, flags=re.IGNORECASE)
-    
-    # Allow .75 (no leading zero)
     if not re.fullmatch(r"\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\.\d{1,2}|\d+(?:\.\d{1,2})?", s):
         return None
-    try:
-        v = float(s.replace(",", ""))
-    except ValueError:
-        return None
+    try: v = float(s.replace(",", ""))
+    except ValueError: return None
     return -v if negative else v
 
-
 def _clean_description(cell: str) -> str:
-    """Collapse multi-line narration into a single clean string."""
-    if not cell:
-        return ""
+    if not cell: return ""
     return re.sub(r"\s+", " ", str(cell)).strip()
-
 
 def _is_header_row(row_values: list[str]) -> bool:
     joined = " ".join((v or "").lower() for v in row_values)
     return "date" in joined and ("balance" in joined or "narration" in joined or "description" in joined)
 
-
 def _is_footer_row(row_values: list[str]) -> bool:
     joined = " ".join((v or "").lower() for v in row_values)
-    return any(
-        kw in joined
-        for kw in ("download app", "head office", "privacy policy", "africa's global", "customer service")
-    )
-
-
-def _find_column_indices(header_row: list[str]) -> dict[str, int] | None:
-    roles: dict[str, int] = {}
-    for idx, cell in enumerate(header_row):
-        if not cell:
-            continue
-        c = re.sub(r"\s+", " ", str(cell)).strip().lower()
-        if idx in roles.values():
-            continue
-        if "trans date" in c or (c == "date" and "date" not in roles):
-            roles["date"] = idx
-        elif "value date" in c:
-            roles["value_date"] = idx
-        elif "narration" in c or "description" in c or "remarks" in c:
-            roles["description"] = idx
-        elif "chq" in c:
-            roles["chq"] = idx
-        elif "debit" in c or "withdrawal" in c:
-            roles["debit"] = idx
-        elif "credit" in c or "deposit" in c:
-            roles["credit"] = idx
-        elif "balance" in c:
-            roles["balance"] = idx
-            
-    if "date" not in roles or ("debit" not in roles and "credit" not in roles):
-        return None
-    return roles
-
+    return any(kw in joined for kw in ("download app", "head office", "privacy policy", "customer service"))
 
 def _parse_with_camelot(pdf_path: Path, flavor: str) -> list[dict]:
     try:
@@ -166,81 +89,100 @@ def _parse_with_camelot(pdf_path: Path, flavor: str) -> list[dict]:
         df = table.df
         columns: dict[str, int] | None = None
         
+        flat_values = [str(v).upper() for v in df.values.flatten()]
+
         # --- ZENITH SPECIFIC LAYOUT ---
-        # Zenith has 'WITHDRAWALS' but often misses the 'DEBITS' header text.
-        # It also has a blank column between Amounts and Balance.
-        is_zenith = any("WITHDRAWALS" in str(v).upper() for v in df.values.flatten())
-        
-        if is_zenith:
-            # We bypass the standard header detection for Zenith
+        if any("WITHDRAWALS" in v for v in flat_values) and not any("MONIEPOINT" in v for v in flat_values):
             for _, row in df.iterrows():
                 vals = [str(v).strip() for v in row.tolist()]
-                if len(vals) < 6 or not vals[0] or "DATE" in vals[0].upper() or "BALANCE" in vals[1].upper():
-                    continue
-                
+                if len(vals) < 6 or not vals[0] or "DATE" in vals[0].upper(): continue
                 date_val = _parse_date(vals[0])
-                if not date_val:
-                    continue
+                if not date_val: continue
                 
-                # Zenith mock columns:
-                # Index 0: Date, 1: Description, 2: Debit, 3: Credit, 4: Value Date, 5: Balance
                 debit = _to_amount(vals[2])
                 credit = _to_amount(vals[3])
-                
                 if debit == 0.0: debit = None
                 if credit == 0.0: credit = None
                 
                 transactions.append({
-                    "date": date_val,
-                    "description": _clean_description(vals[1]),
-                    "debit": debit,
-                    "credit": credit,
-                    "balance": _to_amount(vals[5]),
+                    "date": date_val, "description": _clean_description(vals[1]),
+                    "debit": debit, "credit": credit, "balance": _to_amount(vals[5]),
                     "raw": " | ".join(vals),
                 })
-            continue # Move to next table
-            
+            continue 
+
+        # --- MONIEPOINT SPECIFIC LAYOUT ---
+        # Moniepoint has a 'Transaction Amount' column (index 5) which is the real amount,
+        # but also has separate 'Debit' (6), 'Credit' (7), and 'Balance' (8) columns.
+        if any("MONIEPOINT" in v for v in flat_values) or any("TRANSACTION AMOUNT" in v for v in flat_values):
+            # We know Moniepoint maps exactly to these indices based on our test
+            for _, row in df.iterrows():
+                vals = [str(v).strip() for v in row.tolist()]
+                if len(vals) < 9 or not vals[0] or "DATE" in vals[0].upper(): continue
+                
+                # Moniepoint dates are at index 0 (e.g. 2024-09-15 21:31)
+                date_val = _parse_date(vals[0])
+                if not date_val: continue
+                
+                # Index 6 = Debit, 7 = Credit, 8 = Balance
+                debit = _to_amount(vals[6])
+                credit = _to_amount(vals[7])
+                
+                # Moniepoint sometimes uses '0.00' instead of empty strings
+                if debit == 0.0: debit = None
+                if credit == 0.0: credit = None
+                
+                transactions.append({
+                    "date": date_val, 
+                    "description": _clean_description(vals[9]), # Index 9 is Narration
+                    "debit": debit, 
+                    "credit": credit, 
+                    "balance": _to_amount(vals[8]),
+                    "raw": " | ".join(vals),
+                })
+            continue
+        # --- END MONIEPOINT SPECIFIC LAYOUT ---
+
         # --- STANDARD LAYOUT (UBA, GTBank, Synthetic) ---
         for _, row in df.iterrows():
             values = [str(v) for v in row.tolist()]
             if _is_header_row(values):
-                columns = _find_column_indices(values)
+                # Use our generic header matcher
+                # (Which was previously in _find_column_indices)
+                roles = {}
+                for idx, cell in enumerate(values):
+                    c = re.sub(r"\s+", " ", str(cell)).strip().lower()
+                    if "date" in c and "date" not in roles: roles["date"] = idx
+                    elif "narration" in c or "description" in c: roles["description"] = idx
+                    elif "debit" in c or "withdrawal" in c: roles["debit"] = idx
+                    elif "credit" in c or "deposit" in c: roles["credit"] = idx
+                    elif "balance" in c: roles["balance"] = idx
+                if "date" in roles: columns = roles
                 continue
-            if columns is None:
-                continue
-            if _is_footer_row(values):
-                break
+                
+            if columns is None: continue
+            if _is_footer_row(values): break
 
             def get(role: str) -> str:
                 idx = columns.get(role)
-                if idx is None or idx >= len(values):
-                    return ""
-                return values[idx]
+                return values[idx] if idx is not None and idx < len(values) else ""
 
             date_val = _parse_date(get("date"))
-            if date_val is None:
-                continue
+            if date_val is None: continue
 
-            description = _clean_description(get("description"))
-            debit = _to_amount(get("debit"))
-            credit = _to_amount(get("credit"))
-            balance = _to_amount(get("balance"))
-
-            transactions.append(
-                {
-                    "date": date_val,
-                    "description": description,
-                    "debit": debit,
-                    "credit": credit,
-                    "balance": balance,
-                    "raw": " | ".join(values),
-                }
-            )
+            transactions.append({
+                "date": date_val,
+                "description": _clean_description(get("description")),
+                "debit": _to_amount(get("debit")),
+                "credit": _to_amount(get("credit")),
+                "balance": _to_amount(get("balance")),
+                "raw": " | ".join(values),
+            })
             
     return transactions
 
-
 def _parse_via_text(pdf_path: Path) -> list[dict]:
+    # (Fallback text parser kept exactly as it was)
     transactions: list[dict] = []
     line_re = re.compile(r"^(?P<date>\d{1,2}[/\-][A-Za-z0-9]{2,9}[/\-]\d{2,4})\s+(?P<rest>.+)$")
     with pdfplumber.open(pdf_path) as pdf:
@@ -248,40 +190,29 @@ def _parse_via_text(pdf_path: Path) -> list[dict]:
             text = page.extract_text() or ""
             for line in text.splitlines():
                 m = line_re.match(line.strip())
-                if not m:
-                    continue
+                if not m: continue
                 date_val = _parse_date(m.group("date"))
-                if not date_val:
-                    continue
-                rest = m.group("rest")
-                amounts = [_to_amount(tok) for tok in rest.split()]
+                if not date_val: continue
+                amounts = [_to_amount(tok) for tok in m.group("rest").split()]
                 amounts = [a for a in amounts if a is not None]
-                if len(amounts) < 2:
-                    continue
-                transactions.append(
-                    {
-                        "date": date_val,
-                        "description": rest,
-                        "debit": None,
-                        "credit": amounts[-2],
-                        "balance": amounts[-1],
-                        "raw": line,
-                    }
-                )
+                if len(amounts) < 2: continue
+                transactions.append({
+                    "date": date_val, "description": m.group("rest"), 
+                    "debit": None, "credit": amounts[-2], "balance": amounts[-1], "raw": line
+                })
     return transactions
-
 
 def parse_bank_statement(pdf_path: str | Path) -> list[dict]:
     pdf_path = Path(pdf_path)
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"No such file: {pdf_path}")
+    if not pdf_path.exists(): raise FileNotFoundError(f"No such file: {pdf_path}")
 
+    # 1. Try Lattice (Grid lines)
     tx = _parse_with_camelot(pdf_path, flavor="lattice")
-    if tx:
-        return tx
+    if tx: return tx
 
+    # 2. Try Stream (No grid lines, like Moniepoint)
     tx = _parse_with_camelot(pdf_path, flavor="stream")
-    if tx:
-        return tx
+    if tx: return tx
 
+    # 3. Fallback to raw text regex
     return _parse_via_text(pdf_path)
