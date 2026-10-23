@@ -1,25 +1,20 @@
 # Credit Triage Engine
 
-AI-powered credit risk triage for Nigerian Microfinance Banks (MFBs).
+An AI-powered risk intelligence layer for Nigerian Microfinance Banks. 
 
-Layer 1: Document intelligence engine that parses bank statement PDFs, runs integrity and cash-flow checks, and emits a preliminary risk signal.
+This engine takes unstructured loan documents (bank statements, guarantor forms, collateral docs) and turns them into a structured risk assessment for credit officers.
 
-## Status
+## Architecture
 
-Pre-alpha. Building layer 1 (PDF parsing + fraud checks) locally before any integration or deployment.
+1. **Vision Layer (AI):** Uses a fine-tuned Vision Language Model (Qwen2-VL) to visually read blurry screenshots, photos, and handwritten forms, extracting data into JSON.
+2. **Translation Layer:** Converts the AI's simple "IN/OUT" labels into standard banking Debits/Credits.
+3. **Math Gate (The Bouncer):** Validates the math row-by-row (`Prev Balance - Debit + Credit = Curr Balance`). If the AI hallucinates or a page is missing, the math will not add up, and the system flags the file as `RED` (Tampering Risk).
+4. **Document Parser (PDFs):** Uses Camelot to extract clean tables from digital PDFs (UBA, GTBank, Zenith).
 
-## Structure
+## Current Status
 
-- `src/parsers/` — PDF → structured transaction list
-- `src/checks/` — balance reconciliation, circular transfer detection, recurring debt detection
-- `src/main.py` — CLI entry point
-- `data/samples/` — redacted bank statement PDFs used for local testing (never committed)
-- `tests/` — unit tests
-
-## Local setup
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python -m src.main data/samples/sample.pdf
+- [x] Math Gate Engine (`core/engine.py`) built and tested.
+- [x] Auto-correction logic for AI column mix-ups.
+- [x] PDF Parsing pipeline proven with Camelot.
+- [ ] Vision Model GPU integration (Pending hardware access).
+- [ ] Next.js Web Dashboard.
